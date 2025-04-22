@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>WebAuthn Test</title>
+  <!-- Fix the SimpleWebAuthn import -->
+  <script src="https://unpkg.com/@simplewebauthn/browser/dist/bundle/index.umd.min.js"></script>
+</head>
+<body>
+  <h1>WebAuthn Test</h1>
+  
+  <div>
+    <h2>Register</h2>
+    <input id="username" placeholder="Username" />
+    <button id="register">Register</button>
+  </div>
+  
+  <div>
+    <h2>Login</h2>
+    <input id="loginUsername" placeholder="Username" />
+    <button id="login">Login</button>
+  </div>
+  
+  <pre id="result"></pre>
+  
+  <script>
+    const resultElement = document.getElementById('result');
+    
+    // Register
+    document.getElementById('register').addEventListener('click', async () => {
+      const username = document.getElementById('username').value;
+      
+      try {
+        // 1. Get registration options from server
+        const optionsResponse = await fetch('http://localhost:3000/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username })
+        });
+        
+        const options = await optionsResponse.json();
+        resultElement.textContent = JSON.stringify(options, null, 2);
+        
+        if (!options.success) {
+          throw new Error(options.message);
+        }
+        
+        // 2. Pass options to browser's WebAuthn API
+        // Fix SimpleWebAuthnBrowser reference
+        const registrationResponse = await SimpleWebAuthnBrowser.startRegistration(options.data);
+        
+        // 3. Send response to server for verification
+        const verificationResponse = await fetch('http://localhost:3000/api/auth/register/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username,
+            registrationResponse
+          })
+        });
+        
+        const verification = await verificationResponse.json();
+        resultElement.textContent = JSON.stringify(verification, null, 2);
+      } catch (error) {
+        resultElement.textContent = error.message;
+      }
+    });
+    
+    // Login
+    document.getElementById('login').addEventListener('click', async () => {
+      const username = document.getElementById('loginUsername').value;
+      
+      try {
+        // 1. Get authentication options from server
+        const optionsResponse = await fetch('http://localhost:3000/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username })
+        });
+        
+        const options = await optionsResponse.json();
+        resultElement.textContent = JSON.stringify(options, null, 2);
+        
+        if (!options.success) {
+          throw new Error(options.message);
+        }
+        
+        // 2. Pass options to browser's WebAuthn API
+        // Fix SimpleWebAuthnBrowser reference
+        const authenticationResponse = await SimpleWebAuthnBrowser.startAuthentication(options.data);
+        
+        // 3. Send response to server for verification
+        const verificationResponse = await fetch('http://localhost:3000/api/auth/login/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username,
+            authenticationResponse
+          })
+        });
+        
+        const verification = await verificationResponse.json();
+        resultElement.textContent = JSON.stringify(verification, null, 2);
+        
+        // Store token
+        if (verification.success) {
+          localStorage.setItem('token', verification.token);
+          localStorage.setItem('username', verification.username);
+        }
+      } catch (error) {
+        resultElement.textContent = error.message;
+      }
+    });
+  </script>
+</body>
+</html>
