@@ -7,8 +7,7 @@ import {
   SystemProgram,
   TransactionMessage,
   LAMPORTS_PER_SOL,
-  MessageAccountKeys,
-  TransactionSignature
+  MessageAccountKeys
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
@@ -96,15 +95,108 @@ interface DecodedInstruction {
 }
 
 /**
- * Sponsor a transaction and modify it to include fee collection
- * @param req Request containing the serialized transaction
+ * Step 1: Prepare transaction with fees
+ * This endpoint calculates fees and prepares a transaction with the fee included
+ * @param req Request containing the transaction intent
+ * @param res Response
+ */
+export const prepareFeeTransaction = async (req: Request, res: Response) => {
+  try {
+    console.log('Received request to prepare transaction with fees');
+    
+    // Get the transaction intent from the request
+    const { 
+      recipientAddress, 
+      amount, 
+      senderAddress 
+    } = req.body;
+
+    if (!recipientAddress || !amount || !senderAddress) {
+      return res.status(400).json({ 
+        error: 'Missing required parameters',
+        details: 'recipientAddress, amount, and senderAddress are required'
+      });
+    }
+
+    // Parse input data
+    const recipient = new PublicKey(recipientAddress);
+    const sender = new PublicKey(senderAddress);
+    const transferAmount = parseFloat(amount) * LAMPORTS_PER_SOL;
+    
+    // Calculate fees
+    const serviceFee = calculateServiceFee(transferAmount);
+    const gasFeeReimbursement = ESTIMATED_GAS_FEE;
+    const totalFee = serviceFee + gasFeeReimbursement;
+    
+    console.log(`Calculated fees: Service Fee = ${serviceFee} lamports, Gas Reimbursement = ${gasFeeReimbursement} lamports`);
+    
+    // Get a fresh blockhash
+    const { blockhash } = await connection.getLatestBlockhash('confirmed');
+    
+    // Create both instructions: the user's transfer and the fee payment
+    const transferInstruction = SystemProgram.transfer({
+      fromPubkey: sender,
+      toPubkey: recipient,
+      lamports: transferAmount
+    });
+    
+    const feeInstruction = SystemProgram.transfer({
+      fromPubkey: sender,
+      toPubkey: feeCollectionWallet.publicKey,
+      lamports: totalFee
+    });
+    
+    // Build a transaction with both instructions
+    const messageV0 = new TransactionMessage({
+      payerKey: feePayerWallet.publicKey,  // Backend pays the gas
+      recentBlockhash: blockhash,
+      instructions: [
+        transferInstruction,
+        feeInstruction
+      ]
+    }).compileToV0Message();
+    
+    // Create the transaction
+    const transaction = new VersionedTransaction(messageV0);
+    
+    // Serialize the transaction for the frontend to sign
+    const serializedTransaction = Buffer.from(transaction.serialize()).toString('base64');
+    
+    // Return the transaction with fee information
+    return res.status(200).json({
+      preparedTransaction: serializedTransaction,
+      fees: {
+        originalTransferAmount: transferAmount,
+        serviceFeePercentage: SERVICE_FEE_PERCENTAGE,
+        serviceFeeAmount: serviceFee,
+        gasFeeReimbursement: gasFeeReimbursement,
+        totalFeeRequired: totalFee,
+        feeCollectionAddress: FEE_COLLECTION_ADDRESS
+      },
+      message: 'Transaction prepared with fees. Sign this transaction and submit to the sponsor-transaction endpoint.'
+    });
+    
+  } catch (error: any) {
+    console.error('Error preparing fee transaction:', error);
+    
+    return res.status(500).json({
+      error: 'Failed to prepare transaction',
+      details: error.message
+    });
+  }
+};
+
+/**
+ * Step 2: Process signed transaction with fees
+ * This endpoint processes a transaction that's been signed by the user and includes fees
+ * @param req Request containing the signed transaction
  * @param res Response
  */
 export const sponsorTransaction = async (req: Request, res: Response) => {
   try {
     console.log('Received transaction sponsorship request');
     
-    // Get the partially signed transaction from the request
+    // Get the user-signed transaction from the request
     const { transaction: serializedTransaction } = req.body;
 
     if (!serializedTransaction) {
@@ -113,11 +205,11 @@ export const sponsorTransaction = async (req: Request, res: Response) => {
 
     // Deserialize the transaction
     const transactionBuffer = Buffer.from(serializedTransaction, 'base64');
-    const originalTransaction = VersionedTransaction.deserialize(transactionBuffer);
+    const transaction = VersionedTransaction.deserialize(transactionBuffer);
 
     // Extract message and account keys
-    const originalMessage = originalTransaction.message;
-    const accountKeys = originalMessage.getAccountKeys();
+    const message = transaction.message;
+    const accountKeys = message.getAccountKeys();
     
     // Check fee payer
     const feePayerIndex = 0; // Fee payer is always the first account
@@ -133,181 +225,128 @@ export const sponsorTransaction = async (req: Request, res: Response) => {
       });
     }
 
-    // Extract information about the transfer
+    // Initialize tracking variables
     let transferAmount = 0;
     let senderPublicKey: PublicKey | undefined;
     let recipientPublicKey: PublicKey | undefined;
-    let foundTransfer = false;
+    let feePaymentFound = false;
+    let feePaymentAmount = 0;
     
-    // Get all original instructions
-    const originalInstructions: DecodedInstruction[] = [];
-    
-    for (const instruction of originalMessage.compiledInstructions) {
+    // Check each instruction for transfers and fee payment
+    for (const instruction of message.compiledInstructions) {
       const programId = accountKeys.get(instruction.programIdIndex);
       
       if (!programId) {
-        console.error('Invalid program ID in instruction');
         continue;
       }
       
-      // Decode instruction
-      const instructionAccounts = instruction.accountKeyIndexes.map(
-        index => accountKeys.get(index)
-      ).filter((pubkey): pubkey is PublicKey => pubkey !== undefined);
-      
-      const instructionData = instruction.data;
-      
-      // Recreate the instruction object
-      const decodedInstruction: DecodedInstruction = {
-        programId: programId,
-        keys: instructionAccounts.map((pubkey, i) => ({
-          pubkey,
-          isSigner: originalMessage.isAccountSigner(instruction.accountKeyIndexes[i]),
-          isWritable: originalMessage.isAccountWritable(instruction.accountKeyIndexes[i])
-        })),
-        data: Buffer.from(instructionData)
-      };
-      
-      originalInstructions.push(decodedInstruction);
-      
-      // Check if it's a System Program transfer
+      // Look for System Program transfers
       if (programId.toBase58() === '11111111111111111111111111111111') {
         // Check if it's a transfer (command 2)
         if (instruction.data[0] === 2) {
-          foundTransfer = true;
           const senderIndex = instruction.accountKeyIndexes[0];
           const recipientIndex = instruction.accountKeyIndexes[1];
           
-          senderPublicKey = accountKeys.get(senderIndex);
-          recipientPublicKey = accountKeys.get(recipientIndex);
+          const sender = accountKeys.get(senderIndex);
+          const recipient = accountKeys.get(recipientIndex);
           
-          // Don't allow transactions that transfer tokens from fee payer
-          if (senderPublicKey && senderPublicKey.toBase58() === FEE_PAYER_ADDRESS) {
+          if (!sender || !recipient) continue;
+          
+          // Extract transfer amount
+          const amount = extractTransferAmount(instruction.data);
+          
+          // Don't allow transfers from fee payer
+          if (sender.toBase58() === FEE_PAYER_ADDRESS) {
             return res.status(403).json({
               error: 'Transaction attempts to transfer funds from fee payer'
             });
           }
           
-          // Extract transfer amount
-          transferAmount = extractTransferAmount(instruction.data);
-          
-          if (transferAmount > 0 && senderPublicKey && recipientPublicKey) {
-            console.log(`Detected transfer of ${transferAmount} lamports from ${senderPublicKey.toBase58()} to ${recipientPublicKey.toBase58()}`);
+          // Check if this is a fee payment (transfer to fee collection wallet)
+          if (recipient.toBase58() === FEE_COLLECTION_ADDRESS) {
+            feePaymentFound = true;
+            feePaymentAmount = amount;
+            console.log(`Found fee payment of ${amount} lamports to fee collection wallet`);
+          } else {
+            // This is the user's intended transfer
+            transferAmount = amount;
+            senderPublicKey = sender;
+            recipientPublicKey = recipient;
+            console.log(`Found user transfer of ${amount} lamports from ${sender.toBase58()} to ${recipient.toBase58()}`);
           }
         }
       }
     }
     
-    // If no transfer found, we can still proceed but with minimal fees
-    if (!foundTransfer) {
-      console.log('No transfer instruction found. Proceeding with minimal fees.');
-    }
-    
-    // Calculate fees
-    const serviceFee = calculateServiceFee(transferAmount);
-    const gasFeeReimbursement = ESTIMATED_GAS_FEE;
-    const totalFee = serviceFee + gasFeeReimbursement;
-    
-    console.log(`Calculated fees: Service Fee = ${serviceFee} lamports, Gas Reimbursement = ${gasFeeReimbursement} lamports`);
-    
-    // Check if sender is a signer by examining the signers in the message
+    // Verify sender has signed the transaction
     let senderIsSigner = false;
-    
     if (senderPublicKey) {
-      // A much simpler approach: check if the message indicates the sender is a signer
-      const signerAddresses = [];
-      
-      // Simply check if the sender is marked as a signer in the message
       for (let i = 0; i < accountKeys.length; i++) {
         const key = accountKeys.get(i);
-        if (key && originalMessage.isAccountSigner(i)) {
-          signerAddresses.push(key.toBase58());
+        if (key && key.toBase58() === senderPublicKey.toBase58() && message.isAccountSigner(i)) {
+          senderIsSigner = true;
+          break;
         }
       }
-      
-      senderIsSigner = signerAddresses.includes(senderPublicKey.toBase58());
-      console.log(`Sender ${senderPublicKey.toBase58()} is ${senderIsSigner ? 'a signer' : 'not a signer'}`);
     }
     
-    // Check if we can collect fees (need sender to be a signer)
-    if (senderPublicKey && senderIsSigner && totalFee > 0) {
-      console.log('Creating modified transaction with fee collection');
-      
-      // Get a fresh blockhash
-      const { blockhash } = await connection.getLatestBlockhash('confirmed');
-      
-      // Create a fee collection instruction
-      const feeInstruction = SystemProgram.transfer({
-        fromPubkey: senderPublicKey,
-        toPubkey: feeCollectionWallet.publicKey,
-        lamports: totalFee
-      });
-      
-      // Instead of trying to modify the existing transaction, we'll create a simpler version
-      // that just includes our fee instruction
-      
-      // For simplicity, just sponsor the original transaction, then immediately after success,
-      // create a new transaction for the fee
-      
-      // Sign with fee payer
-      originalTransaction.sign([feePayerWallet]);
-      
-      // Send the original transaction
-      console.log('Sending original transaction with sponsorship');
-      const signature = await connection.sendTransaction(originalTransaction, {
-        skipPreflight: false,
-        preflightCommitment: 'confirmed',
-        maxRetries: 5
-      });
-      
-      console.log('Transaction sent successfully with signature:', signature);
-      
-      // Return the result with fee information
-      return res.status(200).json({
-        transactionHash: signature,
-        message: 'Transaction sponsored successfully. Note: In a production environment, we would also collect a service fee.',
-        fees: {
-          originalTransferAmount: transferAmount,
-          serviceFeePercentage: SERVICE_FEE_PERCENTAGE,
-          serviceFeeAmount: serviceFee,
-          gasFeeReimbursement: gasFeeReimbursement,
-          totalFeeRequired: totalFee,
-          feeCollectionAddress: FEE_COLLECTION_ADDRESS,
-          note: "For a hackathon implementation, we're only calculating fees. In production, the user would pay these fees."
-        }
-      });
-    } else {
-      // If we can't collect fees (sender not a signer), just sponsor the transaction
-      console.log('Cannot collect fees - proceeding with standard sponsorship');
-      
-      // Sign with fee payer
-      originalTransaction.sign([feePayerWallet]);
-      
-      // Send the transaction
-      console.log('Sending original transaction with sponsorship only');
-      const signature = await connection.sendTransaction(originalTransaction, {
-        skipPreflight: false,
-        preflightCommitment: 'confirmed',
-        maxRetries: 5
-      });
-      
-      console.log('Transaction sent successfully with signature:', signature);
-      
-      // Return the result with fee information (informational only)
-      return res.status(200).json({
-        transactionHash: signature,
-        message: 'Transaction sponsored successfully, but fees not collected',
-        fees: {
-          originalTransferAmount: transferAmount,
-          serviceFeePercentage: SERVICE_FEE_PERCENTAGE,
-          serviceFeeAmount: serviceFee,
-          gasFeeReimbursement: gasFeeReimbursement,
-          totalFeeRequired: totalFee,
-          feeCollectionAddress: FEE_COLLECTION_ADDRESS,
-          note: "Fees could not be collected because the sender is not a signer or no transfer was detected. Please modify your implementation to include these fees."
-        }
+    if (!senderIsSigner) {
+      return res.status(403).json({
+        error: 'Transaction not signed by sender',
+        details: 'The sender must sign the transaction'
       });
     }
+    
+    // Calculate expected fee
+    const expectedServiceFee = calculateServiceFee(transferAmount);
+    const expectedGasFee = ESTIMATED_GAS_FEE;
+    const expectedTotalFee = expectedServiceFee + expectedGasFee;
+    
+    // Verify fee payment
+    const minAcceptableFee = Math.floor(expectedTotalFee * 0.95); // Allow 5% margin for calculations
+    
+    if (!feePaymentFound) {
+      return res.status(403).json({
+        error: 'Missing fee payment',
+        details: `Transaction must include a payment of at least ${expectedTotalFee} lamports to ${FEE_COLLECTION_ADDRESS}`
+      });
+    }
+    
+    if (feePaymentAmount < minAcceptableFee) {
+      return res.status(403).json({
+        error: 'Insufficient fee payment',
+        details: `Fee payment of ${feePaymentAmount} lamports is less than required ${expectedTotalFee} lamports`
+      });
+    }
+    
+    // Transaction is valid, sign with fee payer
+    console.log('Transaction is valid with proper fee payment. Signing with fee payer wallet.');
+    transaction.sign([feePayerWallet]);
+    
+    // Send the transaction
+    console.log('Sending transaction to Solana network');
+    const signature = await connection.sendTransaction(transaction, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+      maxRetries: 5
+    });
+    
+    console.log('Transaction sent successfully with signature:', signature);
+    
+    // Return the transaction hash and fee details
+    return res.status(200).json({
+      transactionHash: signature,
+      message: 'Transaction sponsored successfully with fee payment',
+      fees: {
+        originalTransferAmount: transferAmount,
+        serviceFeePercentage: SERVICE_FEE_PERCENTAGE,
+        serviceFeeAmount: expectedServiceFee,
+        gasFeeReimbursement: expectedGasFee,
+        totalFeePaid: feePaymentAmount,
+        feeCollectionAddress: FEE_COLLECTION_ADDRESS
+      }
+    });
+    
   } catch (error: any) {
     console.error('Error processing transaction:', error);
     
