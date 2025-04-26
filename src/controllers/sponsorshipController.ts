@@ -11,6 +11,7 @@ import {
 } from '@solana/web3.js';
 import bs58 from 'bs58';
 import dotenv from 'dotenv';
+import { calculateAllFees, getCurrentFeeData } from '../utils/feeCalculator';
 
 dotenv.config();
 
@@ -123,12 +124,11 @@ export const prepareFeeTransaction = async (req: Request, res: Response) => {
     const sender = new PublicKey(senderAddress);
     const transferAmount = parseFloat(amount) * LAMPORTS_PER_SOL;
     
-    // Calculate fees
-    const serviceFee = calculateServiceFee(transferAmount);
-    const gasFeeReimbursement = ESTIMATED_GAS_FEE;
-    const totalFee = serviceFee + gasFeeReimbursement;
+    // Calculate fees using dynamic fee calculator
+    const feeInfo = await calculateAllFees(transferAmount);
+    const totalFee = feeInfo.totalFeeRequired;
     
-    console.log(`Calculated fees: Service Fee = ${serviceFee} lamports, Gas Reimbursement = ${gasFeeReimbursement} lamports`);
+    console.log(`Calculated dynamic fees: Service Fee = ${feeInfo.serviceFeeAmount} lamports, Gas Reimbursement = ${feeInfo.gasFeeReimbursement} lamports`);
     
     // Get a fresh blockhash
     const { blockhash } = await connection.getLatestBlockhash('confirmed');
@@ -164,17 +164,13 @@ export const prepareFeeTransaction = async (req: Request, res: Response) => {
     
     // Return the transaction with fee information
     return res.status(200).json({
-      preparedTransaction: serializedTransaction,
-      fees: {
-        originalTransferAmount: transferAmount,
-        serviceFeePercentage: SERVICE_FEE_PERCENTAGE,
-        serviceFeeAmount: serviceFee,
-        gasFeeReimbursement: gasFeeReimbursement,
-        totalFeeRequired: totalFee,
-        feeCollectionAddress: FEE_COLLECTION_ADDRESS
-      },
-      message: 'Transaction prepared with fees. Sign this transaction and submit to the sponsor-transaction endpoint.'
-    });
+        preparedTransaction: serializedTransaction,
+        fees: {
+          ...feeInfo,
+          feeCollectionAddress: FEE_COLLECTION_ADDRESS
+        },
+        message: 'Transaction prepared with fees. Sign this transaction and submit to the sponsor-transaction endpoint.'
+      });
     
   } catch (error: any) {
     console.error('Error preparing fee transaction:', error);
@@ -297,10 +293,11 @@ export const sponsorTransaction = async (req: Request, res: Response) => {
       });
     }
     
-    // Calculate expected fee
-    const expectedServiceFee = calculateServiceFee(transferAmount);
-    const expectedGasFee = ESTIMATED_GAS_FEE;
-    const expectedTotalFee = expectedServiceFee + expectedGasFee;
+    // Calculate expected fee using dynamic calculator
+    const feeInfo = await calculateAllFees(transferAmount);
+    const expectedServiceFee = feeInfo.serviceFeeAmount;
+    const expectedGasFee = feeInfo.gasFeeReimbursement;
+    const expectedTotalFee = feeInfo.totalFeeRequired;
     
     // Verify fee payment
     const minAcceptableFee = Math.floor(expectedTotalFee * 0.95); // Allow 5% margin for calculations
@@ -362,3 +359,34 @@ export const sponsorTransaction = async (req: Request, res: Response) => {
     });
   }
 };
+
+/**
+ * Get current fee rates
+ * This endpoint provides current fee information without preparing a transaction
+ * @param req Request
+ * @param res Response
+ */
+export const getCurrentFeeRates = async (req: Request, res: Response) => {
+    try {
+      const feeData = await getCurrentFeeData();
+      
+      // Return the fee data
+      return res.status(200).json({
+        currentFeeData: {
+          gasFeeLamports: feeData.gasFeeLamports,
+          serviceFeePercentage: feeData.serviceFeePercentage,
+          solPriceUsd: feeData.solPriceUsd,
+          lastUpdated: new Date().toISOString()
+        },
+        message: 'Current fee rates retrieved successfully'
+      });
+      
+    } catch (error: any) {
+      console.error('Error getting current fee rates:', error);
+      
+      return res.status(500).json({
+        error: 'Failed to get fee rates',
+        details: error.message
+      });
+    }
+  };
